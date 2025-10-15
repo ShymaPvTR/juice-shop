@@ -39,13 +39,30 @@ function handleZipFileUpload ({ file }: Request, res: Response, next: NextFuncti
               .pipe(unzipper.Parse())
               .on('entry', function (entry: any) {
                 const fileName = entry.path
-                const absolutePath = path.resolve('uploads/complaints/' + fileName)
-                challengeUtils.solveIf(challenges.fileWriteChallenge, () => { return absolutePath === path.resolve('ftp/legal.md') })
-                if (absolutePath.includes(path.resolve('.'))) {
-                  entry.pipe(fs.createWriteStream('uploads/complaints/' + fileName).on('error', function (err) { next(err) }))
-                } else {
+                
+                // Security Fix: Implement proper path validation and sanitization
+                const sanitizedFileName = path.basename(fileName).replace(/[^a-zA-Z0-9.-]/g, '_')
+                const absolutePath = path.resolve('uploads/complaints/', sanitizedFileName)
+                const uploadsDir = path.resolve('uploads/complaints/')
+                
+                // Challenge compatibility: Check for specific challenge file
+                challengeUtils.solveIf(challenges.fileWriteChallenge, () => { 
+                  return path.resolve('uploads/complaints/' + fileName) === path.resolve('ftp/legal.md') 
+                })
+                
+                // Ensure the file is within the allowed directory (prevent path traversal)
+                if (!absolutePath.startsWith(uploadsDir + path.sep) && absolutePath !== uploadsDir) {
                   entry.autodrain()
+                  return
                 }
+                
+                // Additional validation: ensure filename is safe
+                if (sanitizedFileName.length === 0 || sanitizedFileName === '.' || sanitizedFileName === '..') {
+                  entry.autodrain()
+                  return
+                }
+                
+                entry.pipe(fs.createWriteStream(absolutePath).on('error', function (err) { next(err) }))
               }).on('error', function (err: unknown) { next(err) })
           })
         })
