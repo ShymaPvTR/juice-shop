@@ -20,10 +20,10 @@ export function searchProducts () {
   return (req: Request, res: Response, next: NextFunction) => {
     let criteria: any = req.query.q === 'undefined' ? '' : req.query.q ?? ''
     criteria = (criteria.length <= 200) ? criteria : criteria.substring(0, 200)
-    
+
     // SECURITY FIX: Use parameterized query to prevent SQL injection
     models.sequelize.query(
-      `SELECT * FROM Products WHERE ((name LIKE ? OR description LIKE ?) AND deletedAt IS NULL) ORDER BY name`,
+      'SELECT * FROM Products WHERE ((name LIKE ? OR description LIKE ?) AND deletedAt IS NULL) ORDER BY name',
       {
         replacements: [`%${criteria}%`, `%${criteria}%`],
         type: models.sequelize.QueryTypes.SELECT
