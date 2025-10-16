@@ -177,20 +177,69 @@ restoreOverwrittenFilesWithOriginals().then(() => {
   /* Compression for all requests */
   app.use(compression())
 
-  /* Bludgeon solution for possible CORS problems: Allow everything! */
-  app.options('*', cors())
-  app.use(cors())
+  /* Enhanced Security Headers with Helmet */
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "https:"],
+        connectSrc: ["'self'"],
+        fontSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        mediaSrc: ["'self'"],
+        frameSrc: ["'none'"]
+      }
+    },
+    crossOriginEmbedderPolicy: false, // Disable for compatibility
+    hsts: {
+      maxAge: 31536000,
+      includeSubDomains: true,
+      preload: true
+    },
+    noSniff: true,
+    frameguard: { action: 'deny' },
+    xssFilter: false // Disabled for educational purposes
+  }))
 
-  /* Security middleware */
-  app.use(helmet.noSniff())
-  app.use(helmet.frameguard())
-  // app.use(helmet.xssFilter()); // = no protection from persisted XSS via RESTful API
+  /* Secure CORS Configuration */
+  const corsOptions = {
+    origin: process.env.NODE_ENV === 'production' 
+      ? ['https://juice-shop.herokuapp.com', 'https://owasp-juice.shop']
+      : true,
+    credentials: true,
+    optionsSuccessStatus: 200,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+  }
+  
+  app.options('*', cors(corsOptions))
+  app.use(cors(corsOptions))
+
+  /* Remove server signature */
   app.disable('x-powered-by')
+  
+  /* Feature Policy */
   app.use(featurePolicy({
     features: {
-      payment: ["'self'"]
+      payment: ["'self'"],
+      camera: ["'none'"],
+      microphone: ["'none'"],
+      geolocation: ["'none'"],
+      notifications: ["'none'"]
     }
   }))
+
+  /* Global Rate Limiting */
+  const globalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 1000, // Limit each IP to 1000 requests per windowMs
+    message: 'Too many requests from this IP, please try again later.',
+    standardHeaders: true,
+    legacyHeaders: false
+  })
+  app.use(globalLimiter)
 
   /* Hiring header */
   app.use((req: Request, res: Response, next: NextFunction) => {
@@ -203,6 +252,10 @@ restoreOverwrittenFilesWithOriginals().then(() => {
     req.url = req.url.replace(/[/]+/g, '/')
     next()
   })
+
+  /* Request size limits */
+  app.use(bodyParser.json({ limit: '10mb' }))
+  app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }))
 
   /* Increase request counter metric for every request */
   app.use(metrics.observeRequestMetricsMiddleware())
@@ -286,7 +339,13 @@ restoreOverwrittenFilesWithOriginals().then(() => {
   app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument))
 
   app.use(express.static(path.resolve('frontend/dist/frontend')))
-  app.use(cookieParser('kekse'))
+  
+  /* Secure Cookie Parser */
+  app.use(cookieParser('kekse', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict'
+  }))
   // vuln-code-snippet end directoryListingChallenge accessLogDisclosureChallenge
 
   /* Configure and enable backend-side i18n */
@@ -299,12 +358,41 @@ restoreOverwrittenFilesWithOriginals().then(() => {
   })
   app.use(i18n.init)
 
-  app.use(bodyParser.urlencoded({ extended: true }))
-  /* File Upload */
-  app.post('/file-upload', uploadToMemory.single('file'), ensureFileIsPassed, metrics.observeFileUploadMetricsMiddleware(), checkUploadSize, checkFileType, handleZipFileUpload, handleXmlUpload, handleYamlUpload)
-  app.post('/profile/image/file', uploadToMemory.single('file'), ensureFileIsPassed, metrics.observeFileUploadMetricsMiddleware(), profileImageFileUpload())
-  app.post('/profile/image/url', uploadToMemory.single('file'), profileImageUrlUpload())
-  app.post('/rest/memories', uploadToDisk.single('image'), ensureFileIsPassed, security.appendUserId(), metrics.observeFileUploadMetricsMiddleware(), addMemory())
+  /* File Upload with enhanced security */
+  app.post('/file-upload', 
+    rateLimit({ windowMs: 15 * 60 * 1000, max: 10 }),
+    uploadToMemory.single('file'), 
+    ensureFileIsPassed, 
+    metrics.observeFileUploadMetricsMiddleware(), 
+    checkUploadSize, 
+    checkFileType, 
+    handleZipFileUpload, 
+    handleXmlUpload, 
+    handleYamlUpload
+  )
+  
+  app.post('/profile/image/file', 
+    rateLimit({ windowMs: 15 * 60 * 1000, max: 5 }),
+    uploadToMemory.single('file'), 
+    ensureFileIsPassed, 
+    metrics.observeFileUploadMetricsMiddleware(), 
+    profileImageFileUpload()
+  )
+  
+  app.post('/profile/image/url', 
+    rateLimit({ windowMs: 15 * 60 * 1000, max: 5 }),
+    uploadToMemory.single('file'), 
+    profileImageUrlUpload()
+  )
+  
+  app.post('/rest/memories', 
+    rateLimit({ windowMs: 15 * 60 * 1000, max: 10 }),
+    uploadToDisk.single('image'), 
+    ensureFileIsPassed, 
+    security.appendUserId(), 
+    metrics.observeFileUploadMetricsMiddleware(), 
+    addMemory()
+  )
 
   app.use(bodyParser.text({ type: '*/*' }))
   app.use(function jsonParser (req: Request, res: Response, next: NextFunction) {
@@ -333,12 +421,29 @@ restoreOverwrittenFilesWithOriginals().then(() => {
   app.use(morgan('combined', { stream: accessLogStream }))
 
   // vuln-code-snippet start resetPasswordMortyChallenge
-  /* Rate limiting */
+  /* Enhanced Rate limiting for sensitive endpoints */
   app.enable('trust proxy')
+  
+  // Login rate limiting
+  app.use('/rest/user/login', rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 5, // 5 attempts per window
+    skipSuccessfulRequests: true,
+    message: 'Too many login attempts, please try again later.'
+  }))
+  
+  // Password reset rate limiting
   app.use('/rest/user/reset-password', rateLimit({
     windowMs: 5 * 60 * 1000,
-    max: 100,
+    max: 3, // Reduced from 100 to 3
     keyGenerator ({ headers, ip }: { headers: any, ip: any }) { return headers['X-Forwarded-For'] ?? ip } // vuln-code-snippet vuln-line resetPasswordMortyChallenge
+  }))
+  
+  // Search rate limiting
+  app.use('/rest/products/search', rateLimit({
+    windowMs: 1 * 60 * 1000, // 1 minute
+    max: 30, // 30 searches per minute
+    message: 'Too many search requests, please try again later.'
   }))
   // vuln-code-snippet end resetPasswordMortyChallenge
 
@@ -450,20 +555,20 @@ restoreOverwrittenFilesWithOriginals().then(() => {
 
   /* Verify the 2FA Token */
   app.post('/rest/2fa/verify',
-    rateLimit({ windowMs: 5 * 60 * 1000, max: 100, validate: false }),
+    rateLimit({ windowMs: 5 * 60 * 1000, max: 10, validate: false }),
     twoFactorAuth.verify
   )
   /* Check 2FA Status for the current User */
   app.get('/rest/2fa/status', security.isAuthorized(), twoFactorAuth.status)
   /* Enable 2FA for the current User */
   app.post('/rest/2fa/setup',
-    rateLimit({ windowMs: 5 * 60 * 1000, max: 100, validate: false }),
+    rateLimit({ windowMs: 5 * 60 * 1000, max: 5, validate: false }),
     security.isAuthorized(),
     twoFactorAuth.setup
   )
   /* Disable 2FA Status for the current User */
   app.post('/rest/2fa/disable',
-    rateLimit({ windowMs: 5 * 60 * 1000, max: 100, validate: false }),
+    rateLimit({ windowMs: 5 * 60 * 1000, max: 5, validate: false }),
     security.isAuthorized(),
     twoFactorAuth.disable
   )
@@ -673,12 +778,30 @@ restoreOverwrittenFilesWithOriginals().then(() => {
   console.error(err)
 })
 
-const uploadToMemory = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200000 } })
+/* Enhanced file upload security */
+const uploadToMemory = multer({ 
+  storage: multer.memoryStorage(), 
+  limits: { 
+    fileSize: 200000, // 200KB limit
+    files: 1 // Only one file at a time
+  },
+  fileFilter: (req, file, cb) => {
+    // Allow only specific file types
+    const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'application/pdf']
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true)
+    } else {
+      cb(new Error('Invalid file type'), false)
+    }
+  }
+})
+
 const mimeTypeMap: any = {
   'image/png': 'png',
   'image/jpeg': 'jpg',
   'image/jpg': 'jpg'
 }
+
 const uploadToDisk = multer({
   storage: multer.diskStorage({
     destination: (req: Request, file: any, cb: any) => {
@@ -697,7 +820,11 @@ const uploadToDisk = multer({
       const ext = mimeTypeMap[file.mimetype]
       cb(null, name + '-' + Date.now() + '.' + ext)
     }
-  })
+  }),
+  limits: { 
+    fileSize: 5 * 1024 * 1024, // 5MB limit
+    files: 1
+  }
 })
 
 const expectedModels = ['Address', 'Basket', 'BasketItem', 'Captcha', 'Card', 'Challenge', 'Complaint', 'Delivery', 'Feedback', 'ImageCaptcha', 'Memory', 'PrivacyRequestModel', 'Product', 'Quantity', 'Recycle', 'SecurityAnswer', 'SecurityQuestion', 'User', 'Wallet', 'Hint']
@@ -707,10 +834,13 @@ while (!expectedModels.every(model => Object.keys(sequelize.models).includes(mod
 logger.info(`Entity models ${colors.bold(Object.keys(sequelize.models).length.toString())} of ${colors.bold(expectedModels.length.toString())} are initialized (${colors.green('OK')})`)
 
 // vuln-code-snippet start exposedMetricsChallenge
-/* Serve metrics */
+/* Serve metrics with authentication */
 let metricsUpdateLoop: any
 const Metrics = metrics.observeMetrics() // vuln-code-snippet neutral-line exposedMetricsChallenge
-app.get('/metrics', metrics.serveMetrics()) // vuln-code-snippet vuln-line exposedMetricsChallenge
+
+// Secure metrics endpoint - require authentication
+app.get('/metrics', security.isAuthorized(), metrics.serveMetrics()) // vuln-code-snippet vuln-line exposedMetricsChallenge
+
 errorhandler.title = `${config.get<string>('application.name')} (Express ${utils.version('express')})`
 
 export async function start (readyCallback?: () => void) {

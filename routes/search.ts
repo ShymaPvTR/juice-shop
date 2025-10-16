@@ -4,9 +4,11 @@
  */
 
 import { type Request, type Response, type NextFunction } from 'express'
+import { Op } from 'sequelize'
 
 import * as utils from '../lib/utils'
 import * as models from '../models/index'
+import { ProductModel } from '../models/product'
 import { UserModel } from '../models/user'
 import { challenges } from '../data/datacache'
 import * as challengeUtils from '../lib/challengeUtils'
@@ -19,10 +21,38 @@ class ErrorWithParent extends Error {
 export function searchProducts () {
   return (req: Request, res: Response, next: NextFunction) => {
     let criteria: any = req.query.q === 'undefined' ? '' : req.query.q ?? ''
+    
+    // Input validation and sanitization
+    if (typeof criteria !== 'string') {
+      return res.status(400).json({ error: 'Invalid search criteria' })
+    }
+    
+    criteria = criteria.trim()
     criteria = (criteria.length <= 200) ? criteria : criteria.substring(0, 200)
-    models.sequelize.query(`SELECT * FROM Products WHERE ((name LIKE '%${criteria}%' OR description LIKE '%${criteria}%') AND deletedAt IS NULL) ORDER BY name`) // vuln-code-snippet vuln-line unionSqlInjectionChallenge dbSchemaChallenge
-      .then(([products]: any) => {
+    
+    // Sanitize input to prevent malicious characters
+    criteria = criteria.replace(/[<>'"]/g, '')
+    
+    // Use parameterized query with Sequelize ORM to prevent SQL injection
+    ProductModel.findAll({
+      where: {
+        [Op.and]: [
+          {
+            [Op.or]: [
+              { name: { [Op.like]: `%${criteria}%` } },
+              { description: { [Op.like]: `%${criteria}%` } }
+            ]
+          },
+          { deletedAt: null }
+        ]
+      },
+      order: [['name', 'ASC']],
+      attributes: { exclude: ['createdAt', 'updatedAt'] } // Limit exposed data
+    })
+      .then((products: any) => {
         const dataString = JSON.stringify(products)
+        
+        // Challenge verification logic (preserved for educational purposes)
         if (challengeUtils.notSolved(challenges.unionSqlInjectionChallenge)) { // vuln-code-snippet hide-start
           let solved = true
           UserModel.findAll().then(data => {
@@ -61,13 +91,17 @@ export function searchProducts () {
             }
           })
         } // vuln-code-snippet hide-end
+        
+        // Translate product names and descriptions
         for (let i = 0; i < products.length; i++) {
           products[i].name = req.__(products[i].name)
           products[i].description = req.__(products[i].description)
         }
+        
         res.json(utils.queryResultToJson(products))
       }).catch((error: ErrorWithParent) => {
-        next(error.parent)
+        // Generic error message to prevent information disclosure
+        res.status(500).json({ error: 'Search operation failed' })
       })
   }
 }
