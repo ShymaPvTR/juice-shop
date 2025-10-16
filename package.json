@@ -182,6 +182,7 @@
     "swagger-ui-express": "^5.0.1",
     "ts-node-dev": "^1.1.8",
     "unzipper": "0.9.15",
+    "validator": "^13.12.0",
     "web3": "^4.13.0",
     "winston": "^3.16.0",
     "yaml-schema-validator": "^1.2.3",
