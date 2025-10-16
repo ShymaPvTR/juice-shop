@@ -4,6 +4,7 @@
  */
 import { type Request, type Response, type NextFunction } from 'express'
 import config from 'config'
+import validator from 'validator'
 
 import * as challengeUtils from '../lib/challengeUtils'
 import { challenges, users } from '../data/datacache'
@@ -14,10 +15,35 @@ import * as models from '../models/index'
 import { type User } from '../data/types'
 import * as utils from '../lib/utils'
 
-// vuln-code-snippet start loginAdminChallenge loginBenderChallenge loginJimChallenge
+// Input validation and sanitization
+function validateLoginInput(email: string, password: string): { isValid: boolean, errors: string[] } {
+  const errors: string[] = []
+  
+  // Validate email
+  if (!email || typeof email !== 'string') {
+    errors.push('Email is required')
+  } else if (!validator.isEmail(email)) {
+    errors.push('Invalid email format')
+  } else if (email.length > 254) {
+    errors.push('Email too long')
+  }
+  
+  // Validate password
+  if (!password || typeof password !== 'string') {
+    errors.push('Password is required')
+  } else if (password.length > 1000) {
+    errors.push('Password too long')
+  }
+  
+  return {
+    isValid: errors.length === 0,
+    errors
+  }
+}
+
 export function login () {
   function afterLogin (user: { data: User, bid: number }, res: Response, next: NextFunction) {
-    verifyPostLoginChallenges(user) // vuln-code-snippet hide-line
+    verifyPostLoginChallenges(user)
     BasketModel.findOrCreate({ where: { UserId: user.data.id } })
       .then(([basket]: [BasketModel, boolean]) => {
         const token = security.authorize(user)
@@ -29,32 +55,82 @@ export function login () {
       })
   }
 
-  return (req: Request, res: Response, next: NextFunction) => {
-    verifyPreLoginChallenges(req) // vuln-code-snippet hide-line
-    models.sequelize.query(`SELECT * FROM Users WHERE email = '${req.body.email || ''}' AND password = '${security.hash(req.body.password || '')}' AND deletedAt IS NULL`, { model: UserModel, plain: true }) // vuln-code-snippet vuln-line loginAdminChallenge loginBenderChallenge loginJimChallenge
-      .then((authenticatedUser) => { // vuln-code-snippet neutral-line loginAdminChallenge loginBenderChallenge loginJimChallenge
-        const user = utils.queryResultToJson(authenticatedUser)
-        if (user.data?.id && user.data.totpSecret !== '') {
-          res.status(401).json({
-            status: 'totp_token_required',
-            data: {
-              tmpToken: security.authorize({
-                userId: user.data.id,
-                type: 'password_valid_needs_second_factor_token'
-              })
-            }
-          })
-        } else if (user.data?.id) {
-          // @ts-expect-error FIXME some properties missing in user - vuln-code-snippet hide-line
-          afterLogin(user, res, next)
-        } else {
-          res.status(401).send(res.__('Invalid email or password.'))
-        }
-      }).catch((error: Error) => {
-        next(error)
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      verifyPreLoginChallenges(req)
+      
+      const email = req.body.email || ''
+      const password = req.body.password || ''
+      
+      // Validate input
+      const validation = validateLoginInput(email, password)
+      if (!validation.isValid) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Invalid input',
+          errors: validation.errors
+        })
+      }
+      
+      // Use Sequelize ORM with parameterized queries to prevent SQL injection
+      const authenticatedUser = await UserModel.findOne({
+        where: {
+          email: email,
+          deletedAt: null
+        },
+        raw: true
       })
+      
+      if (!authenticatedUser) {
+        return res.status(401).send(res.__('Invalid email or password.'))
+      }
+      
+      // Verify password using secure comparison
+      let passwordValid = false
+      
+      // Check if password is hashed with bcrypt (new secure method)
+      if (authenticatedUser.password.startsWith('$2b$')) {
+        passwordValid = await security.verifyPassword(password, authenticatedUser.password)
+      } else {
+        // Fallback for existing MD5 hashes (should be migrated)
+        passwordValid = authenticatedUser.password === security.hash(password)
+        
+        // If login successful with old hash, update to bcrypt
+        if (passwordValid) {
+          const newHashedPassword = await security.hashPassword(password)
+          await UserModel.update(
+            { password: newHashedPassword },
+            { where: { id: authenticatedUser.id } }
+          )
+        }
+      }
+      
+      if (!passwordValid) {
+        return res.status(401).send(res.__('Invalid email or password.'))
+      }
+      
+      const user = utils.queryResultToJson(authenticatedUser)
+      
+      if (user.data?.id && user.data.totpSecret !== '') {
+        res.status(401).json({
+          status: 'totp_token_required',
+          data: {
+            tmpToken: security.authorize({
+              userId: user.data.id,
+              type: 'password_valid_needs_second_factor_token'
+            })
+          }
+        })
+      } else if (user.data?.id) {
+        // @ts-expect-error FIXME some properties missing in user
+        afterLogin(user, res, next)
+      } else {
+        res.status(401).send(res.__('Invalid email or password.'))
+      }
+    } catch (error: Error) {
+      next(error)
+    }
   }
-  // vuln-code-snippet end loginAdminChallenge loginBenderChallenge loginJimChallenge
 
   function verifyPreLoginChallenges (req: Request) {
     challengeUtils.solveIf(challenges.weakPasswordChallenge, () => { return req.body.email === 'admin@' + config.get<string>('application.domain') && req.body.password === 'admin123' })
