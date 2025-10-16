@@ -4,6 +4,7 @@
  */
 import { type Request, type Response, type NextFunction } from 'express'
 import config from 'config'
+import validator from 'validator'
 
 import * as challengeUtils from '../lib/challengeUtils'
 import { challenges, users } from '../data/datacache'
@@ -13,6 +14,11 @@ import { UserModel } from '../models/user'
 import * as models from '../models/index'
 import { type User } from '../data/types'
 import * as utils from '../lib/utils'
+
+// Rate limiting for login attempts
+const loginAttempts = new Map<string, { count: number, lastAttempt: number }>()
+const MAX_LOGIN_ATTEMPTS = 5
+const LOCKOUT_TIME = 15 * 60 * 1000 // 15 minutes
 
 // vuln-code-snippet start loginAdminChallenge loginBenderChallenge loginJimChallenge
 export function login () {
@@ -30,28 +36,78 @@ export function login () {
   }
 
   return (req: Request, res: Response, next: NextFunction) => {
+    // Input validation
+    const email = req.body.email || ''
+    const password = req.body.password || ''
+    
+    // Validate email format
+    if (!email || !validator.isEmail(email)) {
+      return res.status(400).json({ error: 'Invalid email format' })
+    }
+    
+    // Validate password presence
+    if (!password || password.length < 1) {
+      return res.status(400).json({ error: 'Password is required' })
+    }
+    
+    // Rate limiting check
+    const clientIP = req.ip || req.connection.remoteAddress || 'unknown'
+    const now = Date.now()
+    const attempts = loginAttempts.get(clientIP)
+    
+    if (attempts && attempts.count >= MAX_LOGIN_ATTEMPTS) {
+      if (now - attempts.lastAttempt < LOCKOUT_TIME) {
+        return res.status(429).json({ error: 'Too many login attempts. Please try again later.' })
+      } else {
+        // Reset attempts after lockout period
+        loginAttempts.delete(clientIP)
+      }
+    }
+    
     verifyPreLoginChallenges(req) // vuln-code-snippet hide-line
-    models.sequelize.query(`SELECT * FROM Users WHERE email = '${req.body.email || ''}' AND password = '${security.hash(req.body.password || '')}' AND deletedAt IS NULL`, { model: UserModel, plain: true }) // vuln-code-snippet vuln-line loginAdminChallenge loginBenderChallenge loginJimChallenge
+    
+    // Use parameterized query with Sequelize ORM to prevent SQL injection
+    UserModel.findOne({
+      where: {
+        email: email.toLowerCase().trim(),
+        password: security.hash(password),
+        deletedAt: null
+      }
+    })
       .then((authenticatedUser) => { // vuln-code-snippet neutral-line loginAdminChallenge loginBenderChallenge loginJimChallenge
-        const user = utils.queryResultToJson(authenticatedUser)
-        if (user.data?.id && user.data.totpSecret !== '') {
-          res.status(401).json({
-            status: 'totp_token_required',
-            data: {
-              tmpToken: security.authorize({
-                userId: user.data.id,
-                type: 'password_valid_needs_second_factor_token'
-              })
-            }
-          })
-        } else if (user.data?.id) {
-          // @ts-expect-error FIXME some properties missing in user - vuln-code-snippet hide-line
-          afterLogin(user, res, next)
+        if (authenticatedUser) {
+          // Reset login attempts on successful login
+          loginAttempts.delete(clientIP)
+          
+          const user = utils.queryResultToJson(authenticatedUser)
+          if (user.data?.id && user.data.totpSecret !== '') {
+            res.status(401).json({
+              status: 'totp_token_required',
+              data: {
+                tmpToken: security.authorize({
+                  userId: user.data.id,
+                  type: 'password_valid_needs_second_factor_token'
+                })
+              }
+            })
+          } else if (user.data?.id) {
+            // @ts-expect-error FIXME some properties missing in user - vuln-code-snippet hide-line
+            afterLogin(user, res, next)
+          } else {
+            // Track failed login attempt
+            const currentAttempts = loginAttempts.get(clientIP) || { count: 0, lastAttempt: 0 }
+            loginAttempts.set(clientIP, { count: currentAttempts.count + 1, lastAttempt: now })
+            res.status(401).json({ error: 'Invalid email or password.' })
+          }
         } else {
-          res.status(401).send(res.__('Invalid email or password.'))
+          // Track failed login attempt
+          const currentAttempts = loginAttempts.get(clientIP) || { count: 0, lastAttempt: 0 }
+          loginAttempts.set(clientIP, { count: currentAttempts.count + 1, lastAttempt: now })
+          res.status(401).json({ error: 'Invalid email or password.' })
         }
       }).catch((error: Error) => {
-        next(error)
+        // Generic error message to prevent information disclosure
+        res.status(500).json({ error: 'Authentication service temporarily unavailable' })
       })
   }
   // vuln-code-snippet end loginAdminChallenge loginBenderChallenge loginJimChallenge
