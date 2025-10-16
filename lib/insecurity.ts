@@ -5,6 +5,7 @@
 
 import fs from 'node:fs'
 import crypto from 'node:crypto'
+import bcrypt from 'bcrypt'
 import { type Request, type Response, type NextFunction } from 'express'
 import { type UserModel } from 'models/user'
 import expressJwt from 'express-jwt'
@@ -21,6 +22,10 @@ import * as z85 from 'z85'
 
 export const publicKey = fs ? fs.readFileSync('encryptionkeys/jwt.pub', 'utf8') : 'placeholder-public-key'
 const privateKey = '-----BEGIN RSA PRIVATE KEY-----\r\nMIICXAIBAAKBgQDNwqLEe9wgTXCbC7+RPdDbBbeqjdbs4kOPOIGzqLpXvJXlxxW8iMz0EaM4BKUqYsIa+ndv3NAn2RxCd5ubVdJJcX43zO6Ko0TFEZx/65gY3BE0O6syCEmUP4qbSd6exou/F+WTISzbQ5FBVPVmhnYhG/kpwt/cIxK5iUn5hm+4tQIDAQABAoGBAI+8xiPoOrA+KMnG/T4jJsG6TsHQcDHvJi7o1IKC/hnIXha0atTX5AUkRRce95qSfvKFweXdJXSQ0JMGJyfuXgU6dI0TcseFRfewXAa/ssxAC+iUVR6KUMh1PE2wXLitfeI6JLvVtrBYswm2I7CtY0q8n5AGimHWVXJPLfGV7m0BAkEA+fqFt2LXbLtyg6wZyxMA/cnmt5Nt3U2dAu77MzFJvibANUNHE4HPLZxjGNXN+a6m0K6TD4kDdh5HfUYLWWRBYQJBANK3carmulBwqzcDBjsJ0YrIONBpCAsXxk8idXb8jL9aNIg15Wumm2enqqObahDHB5jnGOLmbasizvSVqypfM9UCQCQl8xIqy+YgURXzXCN+kwUgHinrutZms87Jyi+D8Br8NY0+Nlf+zHvXAomD2W5CsEK7C+8SLBr3k/TsnRWHJuECQHFE9RA2OP8WoaLPuGCyFXaxzICThSRZYluVnWkZtxsBhW2W8z1b8PvWUE7kMy7TnkzeJS2LSnaNHoyxi7IaPQUCQCwWU4U+v4lD7uYBw00Ga/xt+7+UqFPlPVdz1yyr4q24Zxaw0LgmuEvgU5dycq8N7JxjTubX0MIRR+G9fmDBBl8=\r\n-----END RSA PRIVATE KEY-----'
+
+// Generate secure HMAC key
+const HMAC_SECRET = process.env.HMAC_SECRET || crypto.randomBytes(32).toString('hex')
+const SALT_ROUNDS = 12
 
 interface ResponseWithUser {
   status?: string
@@ -40,8 +45,29 @@ interface IAuthenticatedUsers {
   updateFrom: (req: Request, user: ResponseWithUser) => any
 }
 
-export const hash = (data: string) => crypto.createHash('md5').update(data).digest('hex')
-export const hmac = (data: string) => crypto.createHmac('sha256', 'pa4qacea4VK9t9nGv7yZtwmj').update(data).digest('hex')
+// Secure password hashing with bcrypt
+export const hash = async (data: string): Promise<string> => {
+  try {
+    return await bcrypt.hash(data, SALT_ROUNDS)
+  } catch (error) {
+    throw new Error('Password hashing failed')
+  }
+}
+
+// Secure password verification
+export const verifyHash = async (data: string, hash: string): Promise<boolean> => {
+  try {
+    return await bcrypt.compare(data, hash)
+  } catch (error) {
+    return false
+  }
+}
+
+// Legacy hash function for backward compatibility (deprecated)
+export const hashLegacy = (data: string) => crypto.createHash('md5').update(data).digest('hex')
+
+// Secure HMAC with proper key management
+export const hmac = (data: string) => crypto.createHmac('sha256', HMAC_SECRET).update(data).digest('hex')
 
 export const cutOffPoisonNullByte = (str: string) => {
   const nullByte = '%00'
@@ -57,7 +83,13 @@ export const authorize = (user = {}) => jwt.sign(user, privateKey, { expiresIn: 
 export const verify = (token: string) => token ? (jws.verify as ((token: string, secret: string) => boolean))(token, publicKey) : false
 export const decode = (token: string) => { return jws.decode(token)?.payload }
 
-export const sanitizeHtml = (html: string) => sanitizeHtmlLib(html)
+// Enhanced HTML sanitization
+export const sanitizeHtml = (html: string) => sanitizeHtmlLib(html, {
+  allowedTags: ['b', 'i', 'em', 'strong', 'p', 'br'],
+  allowedAttributes: {},
+  disallowedTagsMode: 'discard'
+})
+
 export const sanitizeLegacy = (input = '') => input.replace(/<(?:\w+)\W+?[\w]/gi, '')
 export const sanitizeFilename = (filename: string) => sanitizeFilenameLib(filename)
 export const sanitizeSecure = (html: string): string => {
@@ -105,15 +137,23 @@ export const discountFromCoupon = (coupon?: string) => {
   if (!coupon) {
     return undefined
   }
-  const decoded = z85.decode(coupon)
-  if (decoded && (hasValidFormat(decoded.toString()) != null)) {
-    const parts = decoded.toString().split('-')
-    const validity = parts[0]
-    if (utils.toMMMYY(new Date()) === validity) {
-      const discount = parts[1]
-      return parseInt(discount)
+  try {
+    const decoded = z85.decode(coupon)
+    if (decoded && (hasValidFormat(decoded.toString()) != null)) {
+      const parts = decoded.toString().split('-')
+      const validity = parts[0]
+      if (utils.toMMMYY(new Date()) === validity) {
+        const discount = parseInt(parts[1])
+        // Validate discount range
+        if (discount >= 0 && discount <= 100) {
+          return discount
+        }
+      }
     }
+  } catch (error) {
+    return undefined
   }
+  return undefined
 }
 
 function hasValidFormat (coupon: string) {
@@ -132,12 +172,24 @@ export const redirectAllowlist = new Set([
   'http://leanpub.com/juice-shop'
 ])
 
+// Secure redirect validation - exact match instead of includes
 export const isRedirectAllowed = (url: string) => {
-  let allowed = false
-  for (const allowedUrl of redirectAllowlist) {
-    allowed = allowed || url.includes(allowedUrl) // vuln-code-snippet vuln-line redirectChallenge
+  try {
+    const parsedUrl = new URL(url)
+    const normalizedUrl = parsedUrl.origin + parsedUrl.pathname
+    
+    for (const allowedUrl of redirectAllowlist) {
+      const parsedAllowed = new URL(allowedUrl)
+      const normalizedAllowed = parsedAllowed.origin + parsedAllowed.pathname
+      
+      if (normalizedUrl === normalizedAllowed) {
+        return true
+      }
+    }
+    return false
+  } catch (error) {
+    return false
   }
-  return allowed
 }
 // vuln-code-snippet end redirectCryptoCurrencyChallenge redirectChallenge
 
@@ -149,7 +201,7 @@ export const roles = {
 }
 
 export const deluxeToken = (email: string) => {
-  const hmac = crypto.createHmac('sha256', privateKey)
+  const hmac = crypto.createHmac('sha256', HMAC_SECRET)
   return hmac.update(email + roles.deluxe).digest('hex')
 }
 
@@ -177,10 +229,14 @@ export const isCustomer = (req: Request) => {
 export const appendUserId = () => {
   return (req: Request, res: Response, next: NextFunction) => {
     try {
-      req.body.UserId = authenticatedUsers.tokenMap[utils.jwtFrom(req)].data.id
+      const token = utils.jwtFrom(req)
+      if (!token || !authenticatedUsers.tokenMap[token]) {
+        return res.status(401).json({ status: 'error', message: 'Invalid or expired token' })
+      }
+      req.body.UserId = authenticatedUsers.tokenMap[token].data.id
       next()
     } catch (error: any) {
-      res.status(401).json({ status: 'error', message: error })
+      res.status(401).json({ status: 'error', message: 'Authentication failed' })
     }
   }
 }
@@ -192,7 +248,12 @@ export const updateAuthenticatedUsers = () => (req: Request, res: Response, next
       if (err === null) {
         if (authenticatedUsers.get(token) === undefined) {
           authenticatedUsers.put(token, decoded)
-          res.cookie('token', token)
+          res.cookie('token', token, {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: 'strict',
+            maxAge: 6 * 60 * 60 * 1000 // 6 hours
+          })
         }
       }
     })
