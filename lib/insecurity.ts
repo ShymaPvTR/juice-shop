@@ -20,7 +20,26 @@ import * as utils from './utils'
 import * as z85 from 'z85'
 
 export const publicKey = fs ? fs.readFileSync('encryptionkeys/jwt.pub', 'utf8') : 'placeholder-public-key'
-const privateKey = '-----BEGIN RSA PRIVATE KEY-----\r\nMIICXAIBAAKBgQDNwqLEe9wgTXCbC7+RPdDbBbeqjdbs4kOPOIGzqLpXvJXlxxW8iMz0EaM4BKUqYsIa+ndv3NAn2RxCd5ubVdJJcX43zO6Ko0TFEZx/65gY3BE0O6syCEmUP4qbSd6exou/F+WTISzbQ5FBVPVmhnYhG/kpwt/cIxK5iUn5hm+4tQIDAQABAoGBAI+8xiPoOrA+KMnG/T4jJsG6TsHQcDHvJi7o1IKC/hnIXha0atTX5AUkRRce95qSfvKFweXdJXSQ0JMGJyfuXgU6dI0TcseFRfewXAa/ssxAC+iUVR6KUMh1PE2wXLitfeI6JLvVtrBYswm2I7CtY0q8n5AGimHWVXJPLfGV7m0BAkEA+fqFt2LXbLtyg6wZyxMA/cnmt5Nt3U2dAu77MzFJvibANUNHE4HPLZxjGNXN+a6m0K6TD4kDdh5HfUYLWWRBYQJBANK3carmulBwqzcDBjsJ0YrIONBpCAsXxk8idXb8jL9aNIg15Wumm2enqqObahDHB5jnGOLmbasizvSVqypfM9UCQCQl8xIqy+YgURXzXCN+kwUgHinrutZms87Jyi+D8Br8NY0+Nlf+zHvXAomD2W5CsEK7C+8SLBr3k/TsnRWHJuECQHFE9RA2OP8WoaLPuGCyFXaxzICThSRZYluVnWkZtxsBhW2W8z1b8PvWUE7kMy7TnkzeJS2LSnaNHoyxi7IaPQUCQCwWU4U+v4lD7uYBw00Ga/xt+7+UqFPlPVdz1yyr4q24Zxaw0LgmuEvgU5dycq8N7JxjTubX0MIRR+G9fmDBBl8=\r\n-----END RSA PRIVATE KEY-----'
+
+// SECURITY FIX: Generate secure private key from environment variable or use a secure default
+const privateKey = process.env.JWT_PRIVATE_KEY || generateSecurePrivateKey()
+
+function generateSecurePrivateKey(): string {
+  // In production, this should be loaded from a secure key management system
+  // For now, generate a cryptographically secure key
+  const keyPair = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    publicKeyEncoding: {
+      type: 'spki',
+      format: 'pem'
+    },
+    privateKeyEncoding: {
+      type: 'pkcs8',
+      format: 'pem'
+    }
+  })
+  return keyPair.privateKey
+}
 
 interface ResponseWithUser {
   status?: string
@@ -40,8 +59,13 @@ interface IAuthenticatedUsers {
   updateFrom: (req: Request, user: ResponseWithUser) => any
 }
 
-export const hash = (data: string) => crypto.createHash('md5').update(data).digest('hex')
-export const hmac = (data: string) => crypto.createHmac('sha256', 'pa4qacea4VK9t9nGv7yZtwmj').update(data).digest('hex')
+// SECURITY FIX: Replace MD5 with SHA-256 for password hashing
+// Note: In production, use bcrypt or argon2 for password hashing
+export const hash = (data: string) => crypto.createHash('sha256').update(data).digest('hex')
+
+// SECURITY FIX: Use environment variable for HMAC secret or generate secure one
+const hmacSecret = process.env.HMAC_SECRET || crypto.randomBytes(32).toString('hex')
+export const hmac = (data: string) => crypto.createHmac('sha256', hmacSecret).update(data).digest('hex')
 
 export const cutOffPoisonNullByte = (str: string) => {
   const nullByte = '%00'
@@ -132,12 +156,27 @@ export const redirectAllowlist = new Set([
   'http://leanpub.com/juice-shop'
 ])
 
+// SECURITY FIX: Use exact URL matching instead of includes() to prevent open redirect
 export const isRedirectAllowed = (url: string) => {
-  let allowed = false
+  // Normalize URL for comparison
+  const normalizedUrl = url.toLowerCase().trim()
+  
+  // Check for exact matches or safe subdomain patterns
   for (const allowedUrl of redirectAllowlist) {
-    allowed = allowed || url.includes(allowedUrl) // vuln-code-snippet vuln-line redirectChallenge
+    const normalizedAllowed = allowedUrl.toLowerCase()
+    
+    // Exact match
+    if (normalizedUrl === normalizedAllowed) {
+      return true
+    }
+    
+    // Allow subpaths of allowed domains (but not subdomains)
+    if (normalizedUrl.startsWith(normalizedAllowed + '/')) {
+      return true
+    }
   }
-  return allowed
+  
+  return false
 }
 // vuln-code-snippet end redirectCryptoCurrencyChallenge redirectChallenge
 
